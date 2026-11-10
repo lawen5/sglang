@@ -1,4 +1,5 @@
 import logging
+import os
 import warnings
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,29 @@ _is_hip = is_hip()
 _is_sail = is_sail()
 
 logger = logging.getLogger(__name__)
+
+
+def experimental_sm120_gdn_backends(runner):
+    """Opt-in only: qualify BF16 FA4 without enabling its unsupported FP8 path."""
+    allowed = {"triton", "trtllm_mha", "flashinfer"}
+    requested = {
+        runner.prefill_attention_backend_str,
+        runner.decode_attention_backend_str,
+    }
+    if (
+        "fa4" in requested
+        and os.environ.get("SGLANG_EXPERIMENTAL_SM120_GDN_FA4") == "1"
+    ):
+        if runner.kv_cache_dtype != torch.bfloat16:
+            raise ValueError(
+                "Experimental SM120 GDN FA4 requires BF16 KV; FP8 is unsupported"
+            )
+        if runner.dtype != runner.kv_cache_dtype:
+            raise ValueError(
+                "Experimental SM120 GDN FA4 requires matching compute and KV dtypes"
+            )
+        allowed.add("fa4")
+    return allowed
 
 
 if TYPE_CHECKING:
@@ -531,7 +555,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
                 if get_platform().is_sm120:
-                    allowed = {"triton", "trtllm_mha", "flashinfer"}
+                    allowed = experimental_sm120_gdn_backends(runner)
                 else:
                     # FlashInfer paged prefill is also valid for SM100 hybrid
                     # GDN models. In particular, quantized KV recipes use it
