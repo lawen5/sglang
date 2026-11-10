@@ -1367,6 +1367,10 @@ class Envs:
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
+    # Override the SM12x FA4 paged causal-prefill tile (e.g. "64x48"). Set
+    # before server startup. "auto" keeps the native heuristics; explicit
+    # tile arguments, decode, local attention and relative bias take precedence.
+    SGLANG_FA4_SM120_PREFILL_TILE = EnvStr("auto")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)

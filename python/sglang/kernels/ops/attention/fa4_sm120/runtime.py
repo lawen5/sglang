@@ -20,7 +20,7 @@ from typing import Callable, Optional
 
 import cutlass.utils as utils_basic
 import torch
-from cutlass import Int32
+from cutlass import BFloat16, Int32
 
 from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
     FlashAttentionForwardSm120,
@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.fa4_sm120.policy import (
 )
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging
 from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
+from sglang.srt.environ import envs
 
 _LAUNCH_PLAN_CAPACITY = 4096
 _WORKSPACE_CAPACITY = 64
@@ -633,6 +634,20 @@ class Sm120ForwardPolicy:
                 raise ValueError("SM120 relative bias requires tile_mn=(64, 128)")
             tile_m, tile_n = 64, 128
         elif tile_mn is None:
+            if (
+                paged_kv
+                and seqlen_q is not None
+                and seqlen_q > 1
+                and is_causal
+                and not is_local
+            ):
+                override = _get_prefill_tile_override()
+                if override is not None:
+                    return _get_prefill_tile_config(
+                        head_dim=head_dim,
+                        head_dim_v=head_dim_v,
+                        tile_mn=override,
+                    )
             tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
                 head_dim,
                 head_dim_v,
@@ -1629,6 +1644,65 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         self._paged_plan_tiles.clear()
         self._paged_workspaces.clear()
         self._paged_workspace_views.clear()
+
+
+@lru_cache(maxsize=1)
+def _get_prefill_tile_override() -> Optional[tuple[int, int]]:
+    """Resolve the startup setting once, on the first eligible prefill."""
+    value = envs.SGLANG_FA4_SM120_PREFILL_TILE.get().strip().lower()
+    if value == "auto":
+        return None
+    try:
+        tile_m, tile_n = (int(part) for part in value.split("x"))
+        if tile_m <= 0 or tile_n <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_FA4_SM120_PREFILL_TILE must be 'auto' or a positive "
+            f"'<M>x<N>' tile, got {value!r}"
+        ) from exc
+    return tile_m, tile_n
+
+
+@lru_cache(maxsize=256)
+def _get_prefill_tile_config(
+    *, head_dim: int, head_dim_v: int, tile_mn: tuple[int, int]
+) -> Sm120ForwardConfig:
+    """Validate and freeze shape-dependent settings once per cached geometry."""
+    tile_m, tile_n = tile_mn
+    config = Sm120ForwardConfig(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        num_stages=FlashAttentionForwardSm120.get_fwd_num_stages(
+            head_dim, head_dim_v, tile_m, tile_n
+        ),
+        num_threads=FlashAttentionForwardSm120.get_fwd_num_threads(
+            head_dim, head_dim_v, tile_m, tile_n, paged_kv=True
+        ),
+    )
+    # SM12x FP16/BF16 kernels have identical geometry constraints. Batch sizes
+    # and sequence lengths do not affect this validation or its cache key.
+    if (
+        config.num_threads < 32
+        or config.num_threads % 32
+        or not FlashAttentionForwardSm120.can_implement(
+            dtype=BFloat16,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_stages=config.num_stages,
+            num_threads=config.num_threads,
+            is_causal=True,
+            paged_kv=True,
+        )
+    ):
+        raise ValueError(
+            f"SGLANG_FA4_SM120_PREFILL_TILE={tile_m}x{tile_n} exceeds "
+            f"SM120 kernel constraints or shared-memory capacity for "
+            f"head_dim={head_dim}, head_dim_v={head_dim_v}"
+        )
+    return config
 
 
 sm120_forward_host = Sm120ForwardHost()
